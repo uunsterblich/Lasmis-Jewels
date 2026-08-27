@@ -36,17 +36,21 @@ def getLeague(league_id, timeout=10):
 def getCurrencies(league, timeout=10):
     """Get currency rates from poe.ninja for a given league string.
     Uses the provided league argument (do not rely on global variables).
+    This version uses requests params to ensure proper URL encoding for league names
+    that contain spaces or special characters (like '#').
     """
-    url = f'https://poe.ninja/api/data/currencyoverview?league={league}&type=Currency'
+    url = 'https://poe.ninja/api/data/currencyoverview'
+    params = { 'league': league, 'type': 'Currency' }
     try:
-        response = requests.get(url, headers=headers, timeout=timeout)
+        response = requests.get(url, headers=headers, params=params, timeout=timeout)
         response.raise_for_status()
     except Exception:
         logger.exception("Failed to fetch currencies from poe.ninja")
         return []
 
     try:
-        currencies = load(response.text).get('lines', [])
+        # use response.json() directly for safety
+        currencies = response.json().get('lines', [])
     except Exception:
         logger.exception("Failed to parse currencies response")
         return []

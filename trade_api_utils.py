@@ -4,46 +4,68 @@ import requests
 import time
 from json import loads as load
 import json
+import os
+import logging
+
+# Basic logger
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 headers = requests.utils.default_headers()
 
-#Current rate-limit header rules: 5:10:60,15:60:300,30:300:1800
+# Current rate-limit header rules: 5:10:60,15:60:300,30:300:1800
 
 headers.update({
     'User-Agent': "IDareYouLV's cluster notable combination price checker",
     'From': 'arturino009@gmail.com'
 })
-cookies = {
-    "POESESSID": "your_poe_session_id"
-}
 
-def getLeague(league_id):
-    leagues = requests.get('http://api.pathofexile.com/leagues', headers=headers)
-    leagues = leagues.json()
-    current_league = leagues[league_id]['id']  # current challenge league
-    return current_league
+# Don't hardcode session IDs or secrets. Read from env if provided.
+POESESSID = os.environ.get('POESESSID')
+cookies = {"POESESSID": POESESSID} if POESESSID else {}
 
 
-def getCurrencies(league):
-    response = requests.get(
-        'https://poe.ninja/api/data/currencyoverview?league=' + current_league + '&type=Currency', headers=headers)
-    currencies = load(response.text)['lines']
-    rates = {
-        c['currencyTypeName']: c['chaosEquivalent'] for c in currencies
-    }
-    with open('currency.json') as json_file:
-        currShort = json.load(json_file)
+def getLeague(league_id, timeout=10):
+    """Return league id string for a given league index. Raises on network errors."""
+    resp = requests.get('http://api.pathofexile.com/leagues', headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    leagues = resp.json()
+    return leagues[league_id]['id']  # may raise IndexError if league_id invalid
+
+
+def getCurrencies(league, timeout=10):
+    """Get currency rates from poe.ninja for a given league string.
+    Uses the provided league argument (do not rely on global variables).
+    """
+    url = f'https://poe.ninja/api/data/currencyoverview?league={league}&type=Currency'
+    try:
+        response = requests.get(url, headers=headers, timeout=timeout)
+        response.raise_for_status()
+    except Exception:
+        logger.exception("Failed to fetch currencies from poe.ninja")
+        return []
+
+    try:
+        currencies = load(response.text).get('lines', [])
+    except Exception:
+        logger.exception("Failed to parse currencies response")
+        return []
+
+    rates = {c['currencyTypeName']: c['chaosEquivalent'] for c in currencies}
+    try:
+        with open('currency.json') as json_file:
+            currShort = json.load(json_file)
+    except Exception:
+        logger.exception('Failed to open currency.json')
+        currShort = {}
+
     arr = []
     for name in currShort:
-        for name_a in rates:
-            if name == name_a:
-                x = {
-                    'currFull': name,
-                    'curr': currShort[name],
-                    'rate': rates[name]
-                }
-                arr.append(x)
+        rate = rates.get(name)
+        if rate is not None:
+            arr.append({'currFull': name, 'curr': currShort[name], 'rate': rate})
     return arr
+
 
 class RateLimitedRequester:
     def __init__(self):
@@ -70,46 +92,42 @@ class RateLimitedRequester:
           - If the limit is reached, we wait until the current window resets.
           - If a penalty is active, we wait for that penalty.
         """
-        # Parse the rules and state into lists of tuples.
-        rules = [tuple(map(int, rule.split(':'))) for rule in rate_limit_rules.split(',')]
-        states = [tuple(map(int, state.split(':'))) for state in rate_limit_state.split(',')]
+        try:
+            rules = [tuple(map(int, rule.split(':'))) for rule in rate_limit_rules.split(',')]
+            states = [tuple(map(int, state.split(':'))) for state in rate_limit_state.split(',')]
+        except Exception:
+            # Fallback: no delay
+            return 0
+
         delays = []
         now = time.time()
         for idx, (rule, state) in enumerate(zip(rules, states)):
-            max_requests, timeframe, penalty_time = rule
-            requests_made, state_timeframe, remaining_penalty = state
+            try:
+                max_requests, timeframe, penalty_time = rule
+                requests_made, state_timeframe, remaining_penalty = state
+            except Exception:
+                continue
 
-            # Get or initialize the window start time.
             window_start = window_start_times.get(idx, now)
             elapsed = now - window_start
 
-            # If a penalty is active, enforce that delay.
             if remaining_penalty > 0:
                 delays.append(remaining_penalty)
                 continue
 
             if requests_made < max_requests:
-                # Still below the limit – no delay needed.
                 delay = 0
             else:
-                # If the limit is reached, wait until the window resets.
                 delay = max(0, timeframe - elapsed)
-                formatted_time = time.strftime('%H:%M:%S', time.localtime(window_start))
-                print("Window start time:", formatted_time)
-                formatted_time_now = time.strftime('%H:%M:%S', time.localtime(window_start))
-                print("Time now:", formatted_time_now)
             delays.append(delay)
-        
-        # To be safe, use the most restrictive delay among all rules.
+
         return max(delays) if delays else 0
 
     def update_window_times(self, rate_limit_rules, window_start_times, last_request_time):
-        """
-        For each rule:
-          - If no window start time exists, initialize it to last_request_time.
-          - Otherwise, if the window has expired, update it to last_request_time.
-        """
-        rules = [tuple(map(int, rule.split(':'))) for rule in rate_limit_rules.split(',')]
+        try:
+            rules = [tuple(map(int, rule.split(':'))) for rule in rate_limit_rules.split(',')]
+        except Exception:
+            return
         for idx, (max_requests, timeframe, _) in enumerate(rules):
             if idx not in window_start_times:
                 window_start_times[idx] = last_request_time
@@ -117,333 +135,308 @@ class RateLimitedRequester:
                 if last_request_time - window_start_times[idx] >= timeframe:
                     window_start_times[idx] = last_request_time
 
-
-    def send_request(self, url, data=None):
+    def send_request(self, url, data=None, timeout=15, max_attempts=3):
         last_request_time = None
+        attempt = 0
         while True:
-            current_time = time.time()
-            elapsed_since_last = current_time - last_request_time if last_request_time else 0
-
-            if data:
-                response = requests.post(url, json=data, headers=self.headers, cookies=self.cookies)
-            else:
-                response = requests.get(url, headers=self.headers, cookies=self.cookies)
+            attempt += 1
+            try:
+                if data:
+                    response = requests.post(url, json=data, headers=self.headers, cookies=self.cookies, timeout=timeout)
+                else:
+                    response = requests.get(url, headers=self.headers, cookies=self.cookies, timeout=timeout)
+            except requests.RequestException:
+                logger.exception('Network error while requesting %s', url)
+                if attempt >= max_attempts:
+                    raise
+                time.sleep(1 * attempt)
+                continue
 
             rate_limits = self.get_rate_limit_headers(response)
-            print("Rate limits:", rate_limits)
-
-            global_delay = self.calculate_delay(rate_limits["global_limit"],
-                                                rate_limits["global_state"],
+            global_delay = self.calculate_delay(rate_limits.get("global_limit", ""),
+                                                rate_limits.get("global_state", ""),
                                                 self.global_window_start_times)
-            account_delay = self.calculate_delay(rate_limits["account_limit"],
-                                                 rate_limits["account_state"],
+            account_delay = self.calculate_delay(rate_limits.get("account_limit", ""),
+                                                 rate_limits.get("account_state", ""),
                                                  self.account_window_start_times)
             delay = max(global_delay, account_delay)
-            print("Calculated delay:", delay)
 
-            response_json = response.json()
-            if 'error' in response_json:
-                print("Error:", response_json['error']['message'])
-                time.sleep(delay)
+            try:
+                response_json = response.json()
+            except ValueError:
+                logger.exception('Failed to parse JSON from %s', url)
+                if attempt >= max_attempts:
+                    raise
+                time.sleep(delay or (1 * attempt))
+                continue
+
+            if isinstance(response_json, dict) and 'error' in response_json:
+                logger.warning('API returned error: %s', response_json.get('error'))
+                if attempt >= max_attempts:
+                    return response_json
+                time.sleep(delay or (1 * attempt))
                 continue
 
             last_request_time = time.time()
 
-            # Update the window start times (this call now passes 3 arguments plus self)
-            self.update_window_times(rate_limits["global_limit"],
+            self.update_window_times(rate_limits.get("global_limit", ""),
                                      self.global_window_start_times,
                                      last_request_time)
-            self.update_window_times(rate_limits["account_limit"],
+            self.update_window_times(rate_limits.get("account_limit", ""),
                                      self.account_window_start_times,
                                      last_request_time)
 
-            if delay > elapsed_since_last:
-                time.sleep(delay - elapsed_since_last)
+            if delay and last_request_time and delay > 0:
+                time.sleep(delay)
+
             return response_json
 
 
 # Small breakpoints: 1-49; 50-67; 68-72; 75-77
 # Medium breakpoints: 1-49; 50-67; 68-74; 75-83  //not all have 75 notables, so they have 68-83 breakpoint
 
+
+def _prepare_result_str(result):
+    # result can be a list of ids or a single id string
+    if isinstance(result, list):
+        if len(result) == 0:
+            return ''
+        return ','.join(result) if len(result) > 1 else str(result[0])
+    return str(result)
+
+
 def get_category_jewel_price(a, ilvl, maxlvl):
-    data_set = {  # structure for API request. All info from https://www.reddit.com/r/pathofexiledev/comments/7aiil7/how_to_make_your_own_queries_against_the_official/ . Absolutely no other documentation
+    data_set = {
         "query": {
-            "status": {
-                "option": "online"
-            },
+            "status": {"option": "online"},
             "stats": [{
                 "type": "and",
                 "filters": [{"id": 'enchant.stat_3948993189', "value": {"option": a['clusterId']}},
                             {"id": "enchant.stat_3086156145", "value": {"max": 5}}]
             }],
             "filters": {
-                "type_filters": {
-                    "filters": {
-                        "rarity": {
-                            "option": "nonunique"
-                        }
-                    }
-                },
-                "misc_filters": {
-                    "filters": {
-                        "corrupted": {
-                            "option": "false"
-                        },
-                        "ilvl": {
-                            "min": ilvl,
-                            "max": maxlvl
-                        }
-                    }
-                },
-                "trade_filters": {
-                    "filters": {
-                        "sale_type": {
-                            "option": "priced"
-                        }
-                    }
-                }
+                "type_filters": {"filters": {"rarity": {"option": "nonunique"}}},
+                "misc_filters": {"filters": {"corrupted": {"option": "false"}, "ilvl": {"min": ilvl, "max": maxlvl}}},
+                "trade_filters": {"filters": {"sale_type": {"option": "priced"}}}
             }
         },
-        "sort": {
-            "price": "asc"
-        }
+        "sort": {"price": "asc"}
     }
-    # send the request to API
+
     response = requester.send_request('https://www.pathofexile.com/api/trade/search/' + current_league, data_set)
-    result = response['result']
-    id = response['id']
-    size = response['total']
+    if not isinstance(response, dict):
+        return 0
+    result = response.get('result', [])
+    id_ = response.get('id')
+    size = response.get('total', 0)
     if size == 0:
         return 0
-    # if there are more than 10 listings, strip all of them away after 10th. We cant request info about items more than 10 items at once
-    if size > 10:
-        del result[10:]
 
-    # make correct formatting
-    if size > 1:
-        str1 = ','.join(result)
-    else:
-        str1 = result
+    if size > 10 and isinstance(result, list):
+        result = result[:10]
 
-    # get all actual listings of items
-    address = 'https://www.pathofexile.com/api/trade/fetch/' + \
-        str(str1) + '?query=' + id
-    results_json = requester.send_request(address)
-    # list to hold all prices of an item. Later used to calculate medium price
-    medium = list()
-    #print("Address: " + address)
-    print("Base: " + a['clusterName'])
-    print("ilvl: " + str(ilvl) + "-" + str(maxlvl))
-    print('Listings:' + str(size))
-    for p in results_json['result']:
-        # conversion for some more valuable currency
-        currency = p['listing']['price']['currency']
+    str1 = _prepare_result_str(result)
+    if not str1:
+        return 0
+
+    address = f'https://www.pathofexile.com/api/trade/fetch/{str1}?query={id_}'
+    try:
+        results_json = requester.send_request(address)
+    except Exception:
+        logger.exception('Failed to fetch listings')
+        return 0
+
+    medium = []
+    logger.info('Base: %s', a.get('clusterName'))
+    logger.info('ilvl: %s-%s', ilvl, maxlvl)
+    logger.info('Listings: %s', size)
+
+    for p in results_json.get('result', []) if isinstance(results_json, dict) else []:
+        currency = p.get('listing', {}).get('price', {}).get('currency')
         if currency != 'chaos' or currency == 'p':
             try:
-                curr = [dictionary for dictionary in rates if dictionary["curr"]
-                        == p['listing']['price']['currency']]
+                curr = [dictionary for dictionary in rates if dictionary["curr"] == currency]
                 p['listing']['price']['amount'] = p['listing']['price']['amount'] * curr[0]['rate']
                 p['listing']['price']['currency'] = "chaos"
-            except:
+            except Exception:
                 continue
-        medium.append(p['listing']['price']['amount'])
-    # get the average median of all listed prices for an item
-    if medium == 0:
+        try:
+            medium.append(p['listing']['price']['amount'])
+        except Exception:
+            continue
+
+    if not medium:
         avg = 1
     else:
-        avg = statistics.median_grouped(medium)
-    print("Average median price: " + str(round(avg, 2)) + '\n')
+        try:
+            avg = statistics.median_grouped(medium)
+        except Exception:
+            avg = statistics.median(medium) if medium else 1
+
+    logger.info('Average median price: %s', round(avg, 2))
     return avg
 
 
 def getNotablePrice(cluster_jewel, notable_combination, query, inp, jewel_price):
-    if query == 1:
-        ilvl = notable_combination['notableLevel']
-    else:
-        ilvl = max(notable_combination[0]['notableLevel'], notable_combination[1]['notableLevel'])
+    try:
+        if query == 1:
+            ilvl = int(notable_combination.get('notableLevel', 1))
+        else:
+            ilvl = max(int(notable_combination[0].get('notableLevel', 1)), int(notable_combination[1].get('notableLevel', 1)))
+    except Exception:
+        ilvl = 1
 
-    data_set = {  # structure for API request. All info from https://www.reddit.com/r/pathofexiledev/comments/7aiil7/how_to_make_your_own_queries_against_the_official/ . Absolutely no other documentation
+    data_set = {
         "query": {
-            "status": {
-                "option": "online"
-            },
+            "status": {"option": "online"},
             "type": "Small Cluster Jewel" if inp == 1 else "Medium Cluster Jewel",
             "stats": [{
                 "type": "and",
-                "filters": [{"id": notable_combination['notableId']}] if query == 1 else [{"id": notable_combination[0]['notableId']}, {"id": notable_combination[1]['notableId']},
-                                                                                          {"id": "enchant.stat_3086156145", "value": {"max": 5}}]
+                "filters": ([{"id": notable_combination.get('notableId')}]
+                            if query == 1 else
+                            [{"id": notable_combination[0].get('notableId')}, {"id": notable_combination[1].get('notableId')}, {"id": "enchant.stat_3086156145", "value": {"max": 5}}])
             }],
             "filters": {
-                "type_filters": {
-                    "filters": {
-                        "rarity": {
-                            "option": "nonunique"
-                        }
-                    }
-                },
-                "trade_filters": {
-                    "filters": {
-                        "sale_type": {
-                            "option": "priced"
-                        }
-                    }
-                }
+                "type_filters": {"filters": {"rarity": {"option": "nonunique"}}},
+                "trade_filters": {"filters": {"sale_type": {"option": "priced"}}}
             }
         },
-        "sort": {
-            "price": "asc"
-        }
+        "sort": {"price": "asc"}
     }
-    # send the request to API
-    response = requester.send_request('https://www.pathofexile.com/api/trade/search/' + current_league, data_set)
-    result = response['result']
-    id = response['id']
-    size = response['total']
 
-    # if there are less than 10 listings for an item, we just just skip it (no demand)
+    response = requester.send_request('https://www.pathofexile.com/api/trade/search/' + current_league, data_set)
+    if not isinstance(response, dict):
+        return 0
+    result = response.get('result', [])
+    id_ = response.get('id')
+    size = response.get('total', 0)
+
     if size < 10:
-        print("Not enough items!(" + str(size) + ") Skipping... " + (notable_combination['notableName'] if query == 1 else (notable_combination[0]['notableName'] + " and " + notable_combination[1]['notableName'])) +"\n")
+        name = (notable_combination.get('notableName') if query == 1 else (notable_combination[0].get('notableName', '') + ' and ' + notable_combination[1].get('notableName', '')))
+        logger.info('Not enough items!(%s) Skipping... %s', size, name)
         return 0
 
-    # if there are more than 10 listings, strip all of them away after 10th. We cant request info about items more than 10 items at once
-    if size > 10:
-        del result[10:]
+    if size > 10 and isinstance(result, list):
+        result = result[:10]
 
-    # make correct formatting
-    if size > 1:
-        str1 = ','.join(result)
-    else:
-        str1 = result
+    str1 = _prepare_result_str(result)
+    if not str1:
+        return 0
 
-    # get all actual listings of items
-    address = 'https://www.pathofexile.com/api/trade/fetch/' + \
-        str(str1) + '?query=' + id
-    results_json = requester.send_request(address)
+    address = f'https://www.pathofexile.com/api/trade/fetch/{str1}?query={id_}'
+    try:
+        results_json = requester.send_request(address)
+    except Exception:
+        logger.exception('Failed to fetch listings for notable')
+        return 0
 
-    # probability to get an item while crafting. Formula is mostly correct
-    altPrice = [dictionary for dictionary in rates if dictionary["currFull"]
-                == "Orb of Alteration"][0]['rate']
-    augPrice = [dictionary for dictionary in rates if dictionary["currFull"]
-                == "Orb of Augmentation"][0]['rate']
+    # get currency rates for crafting math
+    try:
+        altPrice = [d for d in rates if d.get('currFull') == "Orb of Alteration"][0]['rate']
+        augPrice = [d for d in rates if d.get('currFull') == "Orb of Augmentation"][0]['rate']
+    except Exception:
+        logger.exception('Failed to resolve craft currency rates')
+        return 0
 
-    clusterPrefixWeight = cluster_jewel['clusterWeightPrefix']      #lvl83 -2100 medium -900 small
+    clusterPrefixWeight = cluster_jewel.get('clusterWeightPrefix', 0)
     weight75 = 900 if inp == 1 else 2100
-    weight68 = (cluster_jewel['clusterNotableLevels'][75] if 75 in cluster_jewel['clusterNotableLevels'] else 0) + weight75 + (1200 if inp == 1 else 0)
-    weight50 = (cluster_jewel['clusterNotableLevels'][68] if 68 in cluster_jewel['clusterNotableLevels'] else 0) + weight68 + (4200 if inp == 1 else 2400)
-    weight1 = (cluster_jewel['clusterNotableLevels'][50] if 50 in cluster_jewel['clusterNotableLevels'] else 0) + weight50
+    weight68 = (cluster_jewel.get('clusterNotableLevels', {}).get(75, 0) if isinstance(cluster_jewel.get('clusterNotableLevels', {}), dict) else 0) + weight75 + (1200 if inp == 1 else 0)
+    weight50 = (cluster_jewel.get('clusterNotableLevels', {}).get(68, 0) if isinstance(cluster_jewel.get('clusterNotableLevels', {}), dict) else 0) + weight68 + (4200 if inp == 1 else 2400)
+    weight1 = (cluster_jewel.get('clusterNotableLevels', {}).get(50, 0) if isinstance(cluster_jewel.get('clusterNotableLevels', {}), dict) else 0) + weight50
 
-    weights = {
-        "1" : weight1,
-        "50" : weight50,
-        "68" : weight68,
-        "75" : weight75,
-        "84" : weight75,
-    }
+    weights = {"1": weight1, "50": weight50, "68": weight68, "75": weight75, "84": weight75}
+    clusterPrefixWeight = clusterPrefixWeight - weights.get(str(ilvl), 0)
 
-    clusterPrefixWeight = clusterPrefixWeight - weights[str(ilvl)]
+    craft_price = 0
+    tries = 1
+    probability = 0
 
     if query == 1:
-        probability = notable_combination['notableWeight']/clusterPrefixWeight
-        tries = math.ceil(1 / probability)
+        probability = notable_combination.get('notableWeight', 0) / clusterPrefixWeight if clusterPrefixWeight else 0
+        tries = math.ceil(1 / probability) if probability else 0
         alt_count = tries
-        aug_count = math.ceil(alt_count/4)
+        aug_count = math.ceil(alt_count / 4) if alt_count else 0
         craft_price = alt_count * altPrice + aug_count * augPrice
-
     else:
-        regalPrice = [
-            dictionary for dictionary in rates if dictionary["currFull"] == "Regal Orb"][0]['rate']
-        scourPrice = [dictionary for dictionary in rates if dictionary["currFull"]
-                      == "Orb of Scouring"][0]['rate']
-        transPrice = [dictionary for dictionary in rates if dictionary["currFull"]
-                      == "Orb of Transmutation"][0]['rate']
+        try:
+            regalPrice = [d for d in rates if d.get('currFull') == "Regal Orb"][0]['rate']
+            scourPrice = [d for d in rates if d.get('currFull') == "Orb of Scouring"][0]['rate']
+            transPrice = [d for d in rates if d.get('currFull') == "Orb of Transmutation"][0]['rate']
+        except Exception:
+            logger.exception('Failed to resolve craft currency rates for double-notable')
+            return 0
 
         suffixWeight = 14150
-
         sweight75 = 1100 if inp == 1 else 3550
         sweight68 = sweight75 + (2200 if inp == 1 else 0)
         sweight50 = sweight68 + (7700 if inp == 1 else 4750)
         sweight1 = sweight50
+        sweights = {"1": sweight1, "50": sweight50, "68": sweight68, "75": sweight75, "84": sweight75}
+        suffixWeight = suffixWeight - sweights.get(str(ilvl), 0)
 
-        sweights = {
-        "1" : sweight1,
-        "50" : sweight50,
-        "68" : sweight68,
-        "75" : sweight75,
-        "84" : sweight75
-        }   
-
-        suffixWeight = suffixWeight - sweights[str(ilvl)]
-
-        probabilityFirst = notable_combination[0]['notableWeight'] / clusterPrefixWeight
-        probabilityFirstSecond = notable_combination[1]['notableWeight'] / \
-            (clusterPrefixWeight + suffixWeight - notable_combination[0]['notableWeight'])
+        a0 = notable_combination[0]
+        a1 = notable_combination[1]
+        pw0 = a0.get('notableWeight', 0)
+        pw1 = a1.get('notableWeight', 0)
+        probabilityFirst = pw0 / clusterPrefixWeight if clusterPrefixWeight else 0
+        probabilityFirstSecond = pw1 / (clusterPrefixWeight + suffixWeight - pw0) if (clusterPrefixWeight + suffixWeight - pw0) else 0
         probabilityFirstSucess = probabilityFirst * probabilityFirstSecond
 
-        probabilitySecond = notable_combination[1]['notableWeight'] / clusterPrefixWeight
-        probabilitySecondFirst = notable_combination[0]['notableWeight'] / \
-            (clusterPrefixWeight + suffixWeight - notable_combination[1]['notableWeight'])
+        probabilitySecond = pw1 / clusterPrefixWeight if clusterPrefixWeight else 0
+        probabilitySecondFirst = pw0 / (clusterPrefixWeight + suffixWeight - pw1) if (clusterPrefixWeight + suffixWeight - pw1) else 0
         probabilitySecondSucess = probabilitySecond * probabilitySecondFirst
 
-        probability = probabilityFirstSucess + \
-            probabilitySecondSucess  # overall probability to hit both
+        probability = probabilityFirstSucess + probabilitySecondSucess
 
-        probability_first = (notable_combination[0]['notableWeight'] + notable_combination[1]
-                             ['notableWeight']) / clusterPrefixWeight
-        probability_second = probability/probability_first
+        probability_first = (pw0 + pw1) / clusterPrefixWeight if clusterPrefixWeight else 0
+        probability_second = probability / probability_first if probability_first else 0
 
-        tries = math.ceil(1 / probability)
-        regal_count = math.ceil(1 / probability_second)
-        scour_count = regal_count - 1
-        trans_count = regal_count - 1
-        alt_count = tries - trans_count
-        aug_count = math.ceil((tries + alt_count) / 4) + 1
-        craft_price = alt_count * altPrice + aug_count * augPrice + regal_count * \
-            regalPrice + scour_count * scourPrice + trans_count * transPrice
+        tries = math.ceil(1 / probability) if probability else 0
+        regal_count = math.ceil(1 / probability_second) if probability_second else 0
+        scour_count = max(regal_count - 1, 0)
+        trans_count = max(regal_count - 1, 0)
+        alt_count = max(tries - trans_count, 0)
+        aug_count = math.ceil((tries + alt_count) / 4) + 1 if (tries or alt_count) else 0
+        craft_price = alt_count * altPrice + aug_count * augPrice + regal_count * regalPrice + scour_count * scourPrice + trans_count * transPrice
 
     craft_and_jewel_price = craft_price + jewel_price
 
-    # list to hold all prices of an item. Later used to calculate medium price
-    medium = list()
+    medium = []
+    results_list = results_json.get('result', []) if isinstance(results_json, dict) else []
 
-    if query == 1:
-        print(notable_combination['notableName'] + ": " + str(round(probability*100, 3)) + "%" +
-              " Cost for rerolls: " + str(round(craft_price, 2)) + " Tries: " + str(round(tries)))
-        print('Listings:' + str(size))
-    else:
-        print(notable_combination[0]['notableName'] + " and " + notable_combination[1]['notableName'] + ": " + str(round(probability*100, 3)
-                                                                               ) + "%" + " Cost for rerolls: " + str(round(craft_price, 2)) + " Tries: " + str(round(tries)))
-        print('Listings:' + str(size) + " Weight: " + str(clusterPrefixWeight))
-
-    for p in results_json['result']:
-        # conversion for some more valuable currency
-        currency = p['listing']['price']['currency']
+    for p in results_list:
+        currency = p.get('listing', {}).get('price', {}).get('currency')
         if currency != 'chaos' or currency == 'p':
             try:
-                curr = [dictionary for dictionary in rates if dictionary["curr"]
-                        == p['listing']['price']['currency']]
+                curr = [dictionary for dictionary in rates if dictionary.get("curr") == currency]
                 price = p['listing']['price']['amount'] * curr[0]['rate']
                 p['listing']['price']['amount'] = price
                 p['listing']['price']['currency'] = "chaos"
-            except:
+            except Exception:
                 continue
-        medium.append(p['listing']['price']['amount'])
-        print("Price: ", p['listing']['price']['amount'],
-              " ", p['listing']['price']['currency'], '\n')
+        try:
+            medium.append(p['listing']['price']['amount'])
+        except Exception:
+            continue
 
-    # get the average median of all listed prices for an item
-    avg = statistics.median_grouped(medium)
-    # profit margin
+    if not medium:
+        return 0
+
+    try:
+        avg = statistics.median_grouped(medium)
+    except Exception:
+        avg = statistics.median(medium) if medium else 0
+
     profit = avg - craft_and_jewel_price
-    PPT = profit/tries
+    PPT = profit / tries if tries else 0
     if len(medium) > 1:
-        first = (medium[0]+medium[1])/2
+        first = (medium[0] + medium[1]) / 2
     else:
         first = medium[0]
-    LPPT = (first - craft_and_jewel_price)/tries
-    print("The average median is ", round(avg, 2),
-          "     Profit:", round(profit, 2), '\n')
+    LPPT = (first - craft_and_jewel_price) / tries if tries else 0
+
     x = {
-        'name': notable_combination['notableName'] if query == 1 else (notable_combination[0]['notableName'] + " and " + notable_combination[1]['notableName']),
+        'name': notable_combination.get('notableName') if query == 1 else (notable_combination[0].get('notableName', '') + " and " + notable_combination[1].get('notableName', '')),
         'listings': size,
         'tries': round(tries),
         'craft_price': round(craft_price, 2),
@@ -451,22 +444,26 @@ def getNotablePrice(cluster_jewel, notable_combination, query, inp, jewel_price)
         'average_price': round(avg, 2),
         'profit': round(profit, 2),
         'PPT': round(PPT, 3),
-        'LPPT': round(LPPT, 3), # when first item is a lot cheaper than average
-        'category': cluster_jewel['clusterName'],
+        'LPPT': round(LPPT, 3),
+        'category': cluster_jewel.get('clusterName'),
         'request': data_set,
         'category_full': cluster_jewel,
         'notable_full': notable_combination,
         'ilvl': ilvl,
-        'id': id
+        'id': id_
     }
     return x
-# 8 is default
-# 16 is event 
-current_league_id = 16
-current_league = getLeague(current_league_id)
 
-print("Current league : " + current_league)
 
-rates = getCurrencies(current_league)
+# configuration defaults; override via env if desired
+current_league_id = int(os.environ.get('CURRENT_LEAGUE_ID', 16))
+try:
+    current_league = getLeague(current_league_id)
+except Exception:
+    current_league = os.environ.get('CURRENT_LEAGUE', '')
+
+logger.info("Current league : %s", current_league)
+
+rates = getCurrencies(current_league) if current_league else []
 
 requester = RateLimitedRequester()

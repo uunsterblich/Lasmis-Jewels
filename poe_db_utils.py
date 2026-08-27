@@ -101,14 +101,34 @@ def updateClusterData():
     global allStats
     allStats = responseStats.json()
 
-    leagues = requests.get('http://api.pathofexile.com/leagues', headers=headers)
-    leagues = leagues.json()
-    current_league = leagues[trade_api_utils.current_league_id]['id']  # current challenge league
-    file_dir = "data/" + current_league
-    if (os.path.exists("data") == False):
-        os.mkdir("data")
-    if (os.path.exists(file_dir) == False):
-        os.mkdir(file_dir)
+  # Resolve the league string in a robust order:
+    # 1) use env CURRENT_LEAGUE if set
+    # 2) use trade_api_utils.current_league if present (string)
+    # 3) fallback to numeric CURRENT_LEAGUE_ID or trade_api_utils.current_league_id and query the API
+    current_league = os.environ.get('CURRENT_LEAGUE', '')
+    if not current_league:
+        current_league = getattr(trade_api_utils, 'current_league', '')
+
+    if not current_league:
+        # try to use numeric id
+        try:
+            league_id = int(os.environ.get('CURRENT_LEAGUE_ID', getattr(trade_api_utils, 'current_league_id', 16)))
+        except Exception:
+            logger.error('No valid CURRENT_LEAGUE or CURRENT_LEAGUE_ID; cannot resolve league')
+            return
+
+        try:
+            leagues_resp = requests.get('http://api.pathofexile.com/leagues', headers=headers, timeout=10)
+            leagues_resp.raise_for_status()
+            leagues_list = leagues_resp.json()
+            if 0 <= league_id < len(leagues_list):
+                current_league = leagues_list[league_id]['id']
+            else:
+                logger.error('CURRENT_LEAGUE_ID %s out of range (0..%s)', league_id, len(leagues_list)-1)
+                return
+        except Exception:
+            logger.exception('Failed to resolve current league from API')
+            return
 
     with open(file_dir + '/small.json', 'w') as outfile:
         json.dump(get_data_poedb("Small"), outfile)

@@ -35,39 +35,60 @@ def getLeague(league_id, timeout=10):
 
 def getCurrencies(league, timeout=10):
     """Get currency rates from poe.ninja for a given league string.
-    Uses the provided league argument (do not rely on global variables).
-    This version uses requests params to ensure proper URL encoding for league names
-    that contain spaces or special characters (like '#').
+    Uses requests params to ensure proper URL encoding. On failure falls back
+    to a local currency_rates_local.json file (if present) for offline testing.
     """
     url = 'https://poe.ninja/api/data/currencyoverview'
-    params = { 'league': league, 'type': 'Currency' }
+    params = {'league': league, 'type': 'Currency'}
     try:
         response = requests.get(url, headers=headers, params=params, timeout=timeout)
         response.raise_for_status()
     except Exception:
-        logger.exception("Failed to fetch currencies from poe.ninja")
-        return []
+        logger.exception("Failed to fetch currencies from poe.ninja; trying local fallback")
+        # Try local fallback file
+        try:
+            with open('currency_rates_local.json', 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                # Expect list of {currFull, curr, rate}
+                return data if isinstance(data, list) else []
+        except Exception:
+            logger.exception("No local currency_rates_local.json fallback found or failed to parse")
+            return []
 
     try:
-        # use response.json() directly for safety
         currencies = response.json().get('lines', [])
     except Exception:
-        logger.exception("Failed to parse currencies response")
-        return []
+        logger.exception("Failed to parse currencies response; trying local fallback")
+        try:
+            with open('currency_rates_local.json', 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                return data if isinstance(data, list) else []
+        except Exception:
+            logger.exception("No local currency_rates_local.json fallback found or failed to parse")
+            return []
 
-    rates = {c['currencyTypeName']: c['chaosEquivalent'] for c in currencies}
+    # Build result (map poe.ninja names to short codes from existing currency.json mapping)
+    rates_map = {c['currencyTypeName']: c['chaosEquivalent'] for c in currencies}
     try:
         with open('currency.json') as json_file:
             currShort = json.load(json_file)
     except Exception:
-        logger.exception('Failed to open currency.json')
+        logger.exception('Failed to open currency.json (short name mapping); falling back to simple list')
         currShort = {}
 
     arr = []
-    for name in currShort:
-        rate = rates.get(name)
-        if rate is not None:
-            arr.append({'currFull': name, 'curr': currShort[name], 'rate': rate})
+    # If currShort present, build arr by matching names
+    if isinstance(currShort, dict) and currShort:
+        for name in currShort:
+            rate = rates_map.get(name)
+            if rate is not None:
+                arr.append({'currFull': name, 'curr': currShort[name], 'rate': rate})
+        return arr
+    # Otherwise, produce a generic list from rates_map for common entries
+    for fullname, rate in rates_map.items():
+        # Try to derive short name from fullname (simple heuristic)
+        short = fullname.lower().split()[0] if fullname else fullname
+        arr.append({'currFull': fullname, 'curr': short, 'rate': rate})
     return arr
 
 

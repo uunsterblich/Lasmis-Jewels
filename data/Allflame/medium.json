@@ -1,0 +1,18 @@
+[
+  {
+    "clusterId": "dummy_cluster_1",
+    "clusterName": "Test Cluster",
+    "clusterWeightPrefix": 10000,
+    "clusterNotables": [
+      {
+        "notableId": "stat_1",
+        "notableName": "Notable A",
+        "notableWeight": 100,
+        "notableLevel": 1
+      }
+    ],
+    "clusterNotableCount": 1,
+    "clusterNotableCombinationCount": 0,
+    "clusterNotableLevels": {"1": 100}
+  }
+]

@@ -461,10 +461,14 @@ def getNotablePrice(cluster_jewel, notable_combination, query, inp, jewel_price)
 
 # configuration defaults; override via env if desired
 current_league_id = int(os.environ.get('CURRENT_LEAGUE_ID', 16))
-try:
-    current_league = getLeague(current_league_id)
-except Exception:
-    current_league = os.environ.get('CURRENT_LEAGUE', '')
+# Hardcoded default league to get a quick success; can be overridden via CURRENT_LEAGUE env var.
+current_league = os.environ.get('CURRENT_LEAGUE', 'Allflame')
+# If CURRENT_LEAGUE is empty, fallback to resolving by id for compatibility
+if not current_league:
+    try:
+        current_league = getLeague(current_league_id)
+    except Exception:
+        current_league = ''
 
 logger.info("Current league : %s", current_league)
 

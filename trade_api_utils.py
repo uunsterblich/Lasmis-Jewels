@@ -37,7 +37,19 @@ def getCurrencies(league, timeout=10):
     """Get currency rates from poe.ninja for a given league string.
     Uses requests params to ensure proper URL encoding. On failure falls back
     to a local currency_rates_local.json file (if present) for offline testing.
+    If OFFLINE_MODE is enabled, skip network calls entirely and use the local fallback.
     """
+    # If offline mode is set, skip network and use local fallback immediately
+    offline = os.environ.get('OFFLINE_MODE', '').lower() in ('1', 'true', 'yes')
+    if offline:
+        try:
+            with open('currency_rates_local.json', 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                return data if isinstance(data, list) else []
+        except Exception:
+            logger.exception("OFFLINE_MODE set but currency_rates_local.json not found or invalid")
+            return []
+
     url = 'https://poe.ninja/api/data/currencyoverview'
     params = {'league': league, 'type': 'Currency'}
     try:
@@ -161,6 +173,20 @@ class RateLimitedRequester:
                     window_start_times[idx] = last_request_time
 
     def send_request(self, url, data=None, timeout=15, max_attempts=3):
+        # Support an offline mode that returns safe empty responses to avoid external API calls
+        offline = os.environ.get('OFFLINE_MODE', '').lower() in ('1', 'true', 'yes')
+        if offline:
+            # Fast, safe short-circuits for common endpoints used by this project
+            try:
+                if 'api/trade/search' in url:
+                    return {'result': [], 'total': 0, 'id': None}
+                if 'api/trade/fetch' in url:
+                    return {'result': []}
+                # For any other calls return an empty dict
+                return {}
+            except Exception:
+                return {}
+
         last_request_time = None
         attempt = 0
         while True:

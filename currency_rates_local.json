@@ -1,0 +1,9 @@
+[
+  {"currFull": "Chaos Orb", "curr": "chaos", "rate": 1},
+  {"currFull": "Exalted Orb", "curr": "ex", "rate": 120},
+  {"currFull": "Regal Orb", "curr": "regal", "rate": 14},
+  {"currFull": "Orb of Alteration", "curr": "alt", "rate": 0.02},
+  {"currFull": "Orb of Augmentation", "curr": "aug", "rate": 0.2},
+  {"currFull": "Orb of Scouring", "curr": "scour", "rate": 0.03},
+  {"currFull": "Orb of Transmutation", "curr": "trans", "rate": 0.01}
+]
